@@ -6,6 +6,12 @@
 #include <unistd.h>
 
 int signed_boot = 0;
+#define NUM_TRANSFERS 2
+#define MAX_TRANSFER 16384
+#ifndef min
+#define min(a,b) (((a) < (b)) ? (a) : (b))
+#endif
+
 int verbose = 0;
 int loop = 0;
 int overlay = 0;
@@ -13,6 +19,7 @@ long delay = 500;
 char * directory = NULL;
 char pathname[18];
 
+libusb_context *ctx;
 int out_ep;
 int in_ep;
 
@@ -161,9 +168,43 @@ int Initialize_Device(libusb_context ** ctx, libusb_device_handle ** usb_device)
 	return ret;
 }
 
+
+struct file_transfer {
+  int pos;
+  int active;
+  int error;
+
+  struct libusb_device_handle * usb_device;
+  void *buf;
+  int len;
+
+};
+
+void transfer_cb(struct libusb_transfer *transfer) {
+  struct file_transfer * ft = transfer->user_data;
+
+  ft->active--;
+
+  if(transfer->status != LIBUSB_TRANSFER_COMPLETED) {
+    ft->error = transfer->status;
+    return;
+  }
+
+  if(ft->pos < ft->len) {
+    int transfer_len = min(ft->len - ft->pos, MAX_TRANSFER);
+    libusb_fill_bulk_transfer(transfer, ft->usb_device, out_ep,
+        ft->buf+ft->pos, transfer_len, transfer_cb,ft,10000);
+    libusb_submit_transfer(transfer);
+
+    ft->pos += transfer_len;
+    ft->active++;
+  }
+
+}
+
 int ep_write(void *buf, int len, libusb_device_handle * usb_device)
 {
-	int a_len = 0;
+	int a_len = len;
 	int ret =
 	    libusb_control_transfer(usb_device, LIBUSB_REQUEST_TYPE_VENDOR, 0,
 				    len & 0xffff, len >> 16, NULL, 0, 1000);
@@ -176,9 +217,35 @@ int ep_write(void *buf, int len, libusb_device_handle * usb_device)
 
 	if(len > 0)
 	{
-		ret = libusb_bulk_transfer(usb_device, out_ep, buf, len, &a_len, 100000);
-		if(verbose)
-			printf("libusb_bulk_transfer returned %d\n", ret);
+		struct file_transfer ft = {
+			.pos = 0,
+			.active = NUM_TRANSFERS,
+			.usb_device = usb_device,
+			.buf = buf,
+			.len = len,
+
+		};
+
+		struct libusb_transfer *transfers[NUM_TRANSFERS];
+		for(int i = 0; i < NUM_TRANSFERS; i++) {
+			transfers[i] = libusb_alloc_transfer(0);
+			transfers[i]->user_data = &ft;
+			transfer_cb(transfers[i]);
+		}
+
+		do {
+			libusb_handle_events(ctx);
+		}
+		while(ft.active > 0);
+
+		if(ft.error) {
+			printf("Failed bulk transfer\n");
+			a_len = 0;
+		}
+
+		for(int i = 0; i < NUM_TRANSFERS; i++) {
+			libusb_free_transfer(transfers[i]);
+		}
 	}
 
 	return a_len;
